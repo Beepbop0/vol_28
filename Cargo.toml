@@ -1,0 +1,14 @@
+[package]
+name = "vol_28"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = { version = "1.0.100", features = ["std", "backtrace"]}
+crossterm = "0.29.0"
+humantime = "2.3.0"
+lofty = "0.22.4"
+ratatui = "0.29.0"
+rusqlite = "0.37.0"
+tempfile = "3.23.0"
+walkdir = "2.5.0"
