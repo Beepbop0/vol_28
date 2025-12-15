@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 use std::io::{self, Write};
 use std::iter::Peekable;
 use std::process::Command;
@@ -30,89 +30,6 @@ pub struct Song {
     pub duration_sec: u64,
 }
 
-fn track_from_row<'a>(row: &rusqlite::Row<'a>) -> rusqlite::Result<Song> {
-    Ok(Song {
-        id: row.get(0)?,
-        path: row.get(1)?,
-        title: row.get(2)?,
-        artist: row.get(3)?,
-        album: row.get(4)?,
-        track: row.get(5)?,
-        year: row.get(6)?,
-        duration_sec: row.get(7)?,
-    })
-}
-
-// DB Queries
-fn track_from_id(conn: &Connection, id: i64) -> Result<Song> {
-    let sql = "SELECT id, path, title, artist, album, track, year, duration_sec FROM tracks WHERE id = ?1";
-    conn.query_row(sql, params![id], track_from_row)
-        .with_context(|| format!("Track ID {} not found in database.", id))
-}
-
-fn list_artists(conn: &Connection) -> Result<Vec<String>> {
-    let mut stmt = conn
-        .prepare("SELECT DISTINCT artist FROM tracks ORDER BY artist")
-        .context("failed to prepare query to list all artists")?;
-    stmt.query_map([], |row| row.get::<_, _>(0))
-        .context("failed to query database")?
-        .collect::<Result<Vec<_>, _>>()
-        .context("failed to map artists from database to strings")
-}
-
-fn list_album(conn: &Connection, album: &str) -> Result<Vec<Song>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT
-        id, path, title, artist, album, track, year, duration_sec
-        FROM tracks
-        WHERE album = ?1
-        ORDER BY track",
-        )
-        .context("failed to prepare query to list all tracks in album")?;
-    stmt.query_map([album], track_from_row)
-        .with_context(|| format!("faield to query database for album \"{}\"", album))?
-        .collect::<Result<Vec<_>, _>>()
-        .context("failed to map tracks from database to rust types")
-}
-
-fn list_artist_tracks(conn: &Connection, artist: &str) -> Result<Vec<Song>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT 
-    id, path, title, artist, album, track, year, duration_sec 
-    FROM tracks
-    WHERE artist = ?1
-    ORDER BY year, album, track",
-        )
-        .context("failed to prepare query to list all artist's tracks")?;
-    stmt.query_map([artist], track_from_row)
-        .with_context(|| format!("failed to query database for artist \"{}\"", artist))?
-        .collect::<Result<Vec<_>, _>>()
-        .context("failed to map tracks from database to rust types")
-}
-
-/// Clears the playlist and the staging directory.
-fn search_group(conn: &Connection, terms: &str) -> anyhow::Result<Vec<Song>> {
-    println!("searching for term \"{}\"", terms);
-    let sql = r#"SELECT 
-        t.id, t.path, t.title, t.artist, t.album, t.track, t.year, t.duration_sec
-        FROM tracks AS t
-        INNER JOIN tracks_fts AS f
-        ON f.id = t.id
-        WHERE tracks_fts MATCH '"' || ?1 || '"'
-        LIMIT 50"#;
-
-    let mut stmt = conn
-        .prepare(sql)
-        .context("failed to create search statement")?;
-
-    stmt.query_map([terms], track_from_row)
-        .with_context(|| format!("failed to query database with search term: \"{}\"", terms))?
-        .collect::<Result<Vec<_>, _>>()
-        .context("failed to map tracks from database to rust types")
-}
-
 impl Song {
     pub fn format(&self) -> &str {
         self.path
@@ -123,6 +40,95 @@ impl Song {
 
 fn playlist_duration_secs(playlist: &[Song]) -> u64 {
     playlist.iter().fold(0u64, |acc, s| acc + s.duration_sec)
+}
+
+// DB Queries
+pub mod queries {
+    use super::Song;
+    use anyhow::{Context, Result};
+    use rusqlite::{Connection, params};
+
+    pub fn track_from_row<'a>(row: &rusqlite::Row<'a>) -> rusqlite::Result<Song> {
+        Ok(Song {
+            id: row.get(0)?,
+            path: row.get(1)?,
+            title: row.get(2)?,
+            artist: row.get(3)?,
+            album: row.get(4)?,
+            track: row.get(5)?,
+            year: row.get(6)?,
+            duration_sec: row.get(7)?,
+        })
+    }
+
+    pub fn track_from_id(conn: &Connection, id: i64) -> Result<Song> {
+        let sql = "SELECT id, path, title, artist, album, track, year, duration_sec FROM tracks WHERE id = ?1";
+        conn.query_row(sql, params![id], track_from_row)
+            .with_context(|| format!("Track ID {} not found in database.", id))
+    }
+
+    pub fn list_artists(conn: &Connection) -> Result<Vec<String>> {
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT artist FROM tracks ORDER BY artist")
+            .context("failed to prepare query to list all artists")?;
+        stmt.query_map([], |row| row.get::<_, _>(0))
+            .context("failed to query database")?
+            .collect::<Result<Vec<_>, _>>()
+            .context("failed to map artists from database to strings")
+    }
+
+    pub fn list_album(conn: &Connection, album: &str) -> Result<Vec<Song>> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT
+            id, path, title, artist, album, track, year, duration_sec
+            FROM tracks
+            WHERE album = ?1
+            ORDER BY track",
+            )
+            .context("failed to prepare query to list all tracks in album")?;
+        stmt.query_map([album], track_from_row)
+            .with_context(|| format!("faield to query database for album \"{}\"", album))?
+            .collect::<Result<Vec<_>, _>>()
+            .context("failed to map tracks from database to rust types")
+    }
+
+    pub fn list_artist_tracks(conn: &Connection, artist: &str) -> Result<Vec<Song>> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT
+            id, path, title, artist, album, track, year, duration_sec
+            FROM tracks
+            WHERE artist = ?1
+            ORDER BY year, album, track",
+            )
+            .context("failed to prepare query to list all artist's tracks")?;
+        stmt.query_map([artist], track_from_row)
+            .with_context(|| format!("failed to query database for artist \"{}\"", artist))?
+            .collect::<Result<Vec<_>, _>>()
+            .context("failed to map tracks from database to rust types")
+    }
+
+    /// Clears the playlist and the staging directory.
+    pub fn search_group(conn: &Connection, terms: &str) -> anyhow::Result<Vec<Song>> {
+        println!("searching for term \"{}\"", terms);
+        let sql = r#"SELECT
+            t.id, t.path, t.title, t.artist, t.album, t.track, t.year, t.duration_sec
+            FROM tracks AS t
+            INNER JOIN tracks_fts AS f
+            ON f.id = t.id
+            WHERE tracks_fts MATCH '"' || ?1 || '"'
+            LIMIT 50"#;
+
+        let mut stmt = conn
+            .prepare(sql)
+            .context("failed to create search statement")?;
+
+        stmt.query_map([terms], track_from_row)
+            .with_context(|| format!("failed to query database with search term: \"{}\"", terms))?
+            .collect::<Result<Vec<_>, _>>()
+            .context("failed to map tracks from database to rust types")
+    }
 }
 
 pub struct AppState {
@@ -153,7 +159,7 @@ impl AppState {
     /// Adds a track to the playlist, transcodes it, and checks CD capacity.
     pub fn playlist_add(&mut self, id: i64) -> Result<()> {
         // 1. Retrieve the full track data from DB
-        let track = track_from_id(&self.conn, id)?;
+        let track = queries::track_from_id(&self.conn, id)?;
 
         let track_path = &track.path;
 
@@ -418,13 +424,13 @@ Command:
             ),
         },
         "search" => {
-            let tracks = search_group(&state.conn, join_strings(parts).as_str())?;
+            let tracks = queries::search_group(&state.conn, join_strings(parts).as_str())?;
 
             print_tracks(&tracks[..]);
         }
         "artist-list" => {
             if parts.peek().is_none() {
-                let artists = list_artists(&state.conn)?;
+                let artists = queries::list_artists(&state.conn)?;
                 println!("artists");
                 for artist in artists {
                     println!("{}", artist);
@@ -432,7 +438,7 @@ Command:
             } else {
                 let artist = join_strings(parts);
                 println!("tracks from artist \"{}\"", artist);
-                let tracks = list_artist_tracks(&state.conn, &artist[..])?;
+                let tracks = queries::list_artist_tracks(&state.conn, &artist[..])?;
                 print_tracks(&tracks[..]);
             }
         }
@@ -441,7 +447,7 @@ Command:
                 anyhow::bail!("need an album to list");
             }
             let album = join_strings(parts);
-            let tracks = list_album(&state.conn, &album)?;
+            let tracks = queries::list_album(&state.conn, &album)?;
             print_tracks(&tracks[..]);
         }
         _ => anyhow::bail!("Unknown command\n{}\n", HELP_STR),
