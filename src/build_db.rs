@@ -188,7 +188,7 @@ fn song_from_tags<'a>(
 ) -> anyhow::Result<InsertSong<'a>> {
     use lofty::{
         file::{AudioFile, TaggedFileExt},
-        tag::Accessor,
+        tag::{Accessor, ItemKey, ItemValue},
     };
     use std::borrow::Cow::{Borrowed, Owned};
 
@@ -196,10 +196,14 @@ fn song_from_tags<'a>(
     let properties = tagged_file.properties();
 
     let title = tag.title().context("failed to obtain title tag")?;
-    let mut artist = tag.artist().context("failed to obtain artist tag")?;
-    if artist == "Deadmau5" {
-        artist = Owned(String::from("deadmau5"));
-    }
+    let artist = match tag.get(&ItemKey::AlbumArtist) {
+        Some(artist_tag) => match artist_tag.clone().into_value() {
+            ItemValue::Text(txt) => Owned(txt),
+            _ => tag.artist().context("failed to obtain artist tag")?,
+        },
+        _ => tag.artist().context("failed to obtain artist tag")?,
+    };
+
     let album = tag.album().unwrap_or(Borrowed(""));
     let year = tag.year().unwrap_or(0);
     let track = tag.track().unwrap_or(0);
