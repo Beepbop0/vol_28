@@ -2,7 +2,8 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::io::{self, Write};
 use std::iter::Peekable;
-use std::process::Command;
+use std::sync::mpsc;
+use std::thread;
 use tempfile::TempDir;
 
 use crate::DB_PATH;
@@ -18,7 +19,29 @@ pub fn humantime_secs(secs: u64) -> humantime::FormattedDuration {
     humantime::format_duration(std::time::Duration::from_secs(secs))
 }
 
-#[derive(Debug)]
+pub struct LogLine {
+    pub is_stderr: bool,
+    pub line: String,
+}
+
+pub enum LogMessage {
+    Line(LogLine),
+    Complete(Result<String>),
+}
+
+impl From<LogLine> for LogMessage {
+    fn from(line: LogLine) -> Self {
+        LogMessage::Line(line)
+    }
+}
+
+impl From<Result<String>> for LogMessage {
+    fn from(result: Result<String>) -> Self {
+        LogMessage::Complete(result)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Song {
     pub id: i64,
     pub path: String,
@@ -134,7 +157,6 @@ pub mod queries {
 pub struct AppState {
     conn: Connection,
     playlist: Vec<Song>,
-    staging_dir: TempDir,
 }
 
 impl AppState {
@@ -143,45 +165,113 @@ impl AppState {
         let conn = Connection::open(DB_PATH)
             .context("Failed to open library.db. Ensure it is created and populated.")?;
 
-        // Use tempfile which creates a secure, temporary directory that gets deleted
-        // when it goes out of scope (usually placed in /tmp, which is often tmpfs).
-        let staging_dir = temp_dir().context("Failed to create temporary staging directory")?;
-
-        println!("Staging area: {}", staging_dir.path().display());
-
         Ok(AppState {
             conn,
             playlist: Vec::new(),
-            staging_dir,
         })
     }
 
-    /// Adds a track to the playlist, transcodes it, and checks CD capacity.
-    pub fn playlist_add(&mut self, id: i64) -> Result<()> {
-        // 1. Retrieve the full track data from DB
+    pub fn conn(&self) -> &Connection {
+        return &self.conn;
+    }
+
+    pub fn playlist(&self) -> Vec<Song> {
+        return self.playlist.clone();
+    }
+
+    pub fn playlist_add_by_id(&mut self, id: i64) -> Result<()> {
         let track = queries::track_from_id(&self.conn, id)?;
 
-        let track_path = &track.path;
+        self.playlist_add(track)
+    }
 
-        // 2. Check CD capacity
-        if playlist_duration_secs(&self.playlist[..]) + track.duration_sec > CD_MAX_DURATION_SECONDS
+    pub fn playlist_add(&mut self, song: Song) -> Result<()> {
+        if playlist_duration_secs(&self.playlist[..]) + song.duration_sec > CD_MAX_DURATION_SECONDS
         {
             anyhow::bail!(
-                "Track is too long! Adding would exceed the CD Limit of {} CD limit.",
+                "Track is too long! Adding would exceed the CD Limit of {}",
                 humantime_secs(CD_MAX_DURATION_SECONDS)
             );
         }
 
-        // 3. Transcode and Downsample (FFmpeg)
-        // This is done BEFORE adding to the playlist state to catch immediate file access errors.
-        println!("  -> Transcoding and validating file...");
+        self.playlist.push(song);
 
-        let output_filename = format!("track_{:02}_{}.wav", self.playlist.len() + 1, track.id);
-        let output_path = self.staging_dir.path().join(&output_filename);
+        Ok(())
+    }
+
+    pub fn playlist_remove(&mut self, index: usize) -> bool {
+        if index >= self.playlist.len() {
+            return false;
+        }
+        self.playlist.remove(index);
+
+        true
+    }
+
+    pub fn playlist_clear(&mut self) {
+        self.playlist.clear();
+    }
+
+    pub fn burn(&self) -> Result<(thread::JoinHandle<Result<()>>, mpsc::Receiver<LogMessage>)> {
+        let (tx, rx) = mpsc::channel();
+        let playlist = self.playlist();
+        let handle = thread::spawn(move || -> Result<()> {
+            playlist_burn(playlist, tx).context("failed to burn playlist")
+        });
+
+        Ok((handle, rx))
+    }
+}
+
+/// Executes the final normalization and burning pipeline.
+// - Downsample + decompress music
+// - Normalize
+// - Burn to CD
+pub fn playlist_burn(playlist: Vec<Song>, msgs: mpsc::Sender<LogMessage>) -> Result<()> {
+    use LogMessage::*;
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+    let temp_dir = match temp_dir() {
+        Ok(dir) => dir,
+        Err(err) => {
+            msgs.send(Err(anyhow::anyhow!("failed to setup tempdir: {:?}", err)).into())
+                .context("failed to send")?;
+            return Ok(());
+        }
+    };
+
+    if playlist.is_empty() {
+        msgs.send(Complete(Err(anyhow::anyhow!(
+            "playlist is empty. Add songs first"
+        ))))
+        .context("failed to send")?;
+        return Ok(());
+    }
+
+    let mut downsampled_paths = std::collections::HashMap::new();
+
+    for song in &playlist {
+        if downsampled_paths.contains_key(&song.id) {
+            continue;
+        }
+
+        msgs.send(
+            LogLine {
+                is_stderr: false,
+                line: format!("transcoding track {}...", song.title),
+            }
+            .into(),
+        )
+        .context("failed to send")?;
+        let song_path = &song.path;
+
+        // 3. Transcode and Downsample (FFmpeg)
+        let output_filename = format!("track_{}.wav", song.id);
+        let output_path = temp_dir.path().join(&output_filename);
 
         let status = Command::new("ffmpeg")
             .arg("-i")
-            .arg(track_path)
+            .arg(song_path)
             .arg("-y")
             .arg("-ar")
             .arg("44100")
@@ -190,111 +280,146 @@ impl AppState {
             .arg("-sample_fmt")
             .arg("s16")
             .arg(&output_path)
-            .stdout(std::process::Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status()
-            .with_context(|| format!("FFmpeg failed for source path: {}", track_path))?;
+            .with_context(|| format!("FFmpeg failed for source path: {}", song_path))?;
 
         if !status.success() {
-            anyhow::bail!(
-                "ffmpeg failed to transcode track at path {}. Check source file access and validity.",
-                track_path
-            );
+            msgs.send(Err(anyhow::anyhow!("ffmpeg failed to transcode track at path {}. Check source file access and validity.",
+                song_path
+            )).into()).context("failed to send")?;
+            return Ok(());
         }
-
-        // 4. Update state
-        self.playlist.push(track);
-        println!(
-            "✅ Added track ID {} to playlist. Current duration: {}",
-            id,
-            humantime_secs(playlist_duration_secs(&self.playlist[..]))
-        );
-
-        Ok(())
+        downsampled_paths.insert(song.id, output_path);
     }
 
-    pub fn playlist_clear(&mut self) -> Result<()> {
-        // By creating a new TempDir, the old one is automatically deleted.
-        let new_dir = temp_dir().context("failed to reset staging directory.")?;
+    let wav_files = downsampled_paths.values().cloned().collect::<Vec<_>>();
 
-        self.staging_dir = new_dir;
-        self.playlist.clear();
+    let mut normalize_command = Command::new("normalize");
+    normalize_command
+        .current_dir(temp_dir.path())
+        .arg("-b")
+        .args(wav_files)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
 
-        Ok(())
+    let status = normalize_command
+        .status()
+        .context("Failed to execute normalize. Is it installed?")?;
+
+    if !status.success() {
+        msgs.send(LogMessage::Complete(Err(anyhow::anyhow!(
+            "Audio normalization failed."
+        ))))
+        .context("failed to send")?;
+        return Ok(());
     }
 
-    /// Executes the final normalization and burning pipeline.
-    // TODO: make it so this does everything at once:
-    // - Downsample + decompress music
-    // - Normalize
-    // - Burn to CD
-    // TODO convert this to get the stdout pipe of the process that's running so we can render a view with the playlist burning
-    pub fn playlist_burn(&mut self) -> Result<()> {
-        if self.playlist.is_empty() {
-            anyhow::bail!("Playlist is empty. Add songs first.");
+    msgs.send(
+        LogLine {
+            is_stderr: false,
+            line: String::from("Normalized playlist volume"),
         }
+        .into(),
+    )
+    .context("failed to send")?;
 
-        let staging_path = self.staging_dir.path();
-        let mut wav_files = vec![];
-        for entry in std::fs::read_dir(staging_path)? {
-            let entry = entry.with_context(|| {
-                format!(
-                    "failed to read entry in staging path: {}",
-                    staging_path.display()
+    let playlist_files = playlist
+        .iter()
+        .map(|song| downsampled_paths[&song.id].clone())
+        .collect::<Vec<_>>();
+
+    msgs.send(
+        LogLine {
+            is_stderr: false,
+            line: String::from("Burning playlist"),
+        }
+        .into(),
+    )
+    .context("failed to send")?;
+
+    let mut wodim = Command::new("wodim")
+        .current_dir(temp_dir)
+        .arg("-v")
+        .arg("-eject")
+        .arg("-dao")
+        .arg("-pad")
+        .arg("dev=")
+        .arg(CD_WRITER_DEVICE)
+        .arg("-audio")
+        .args(playlist_files)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("Failed to spawn wodim. Check device path and permissions.")?;
+
+    let (stdout, stderr) = (
+        wodim
+            .stdout
+            .take()
+            .context("failed to get handle to stdout")?,
+        wodim
+            .stderr
+            .take()
+            .context("failed to get handle to stderr")?,
+    );
+
+    let (stdout, stderr) = (BufReader::new(stdout), BufReader::new(stderr));
+
+    let mut handles = vec![];
+    let stdout_sender = msgs.clone();
+    handles.push(thread::spawn(move || -> Result<()> {
+        for line in stdout.lines() {
+            let line = line.context("failed to obtain line from stdout")?;
+            stdout_sender
+                .send(
+                    LogLine {
+                        is_stderr: false,
+                        line,
+                    }
+                    .into(),
                 )
-            })?;
-            let path = entry.path();
-            if path.extension().map_or(false, |e| e == "wav") {
-                // pushing the filename is usually sufficient if current_dir is set
-                let wav_file = path
-                    .file_name()
-                    .with_context(|| {
-                        format!("failed to get file name of file path: {}", path.display())
-                    })?
-                    .to_os_string();
-                wav_files.push(wav_file);
-            }
+                .context("failed to send")?;
         }
-
-        // sort them by playlist order
-        wav_files.sort();
-
-        let mut normalize_command = Command::new("normalize");
-        normalize_command
-            .current_dir(staging_path)
-            .arg("-b")
-            .args(wav_files.clone());
-
-        println!("command to run: {:?}", normalize_command);
-
-        let status = normalize_command
-            .status()
-            .context("Failed to execute normalize. Is it installed?")?;
-
-        if !status.success() {
-            anyhow::bail!("Audio normalization failed.");
-        }
-
-        println!("\n--- Stage 3: Burning Audio CD ---");
-        let status = Command::new("wodim")
-            .current_dir(staging_path)
-            .arg("-v")
-            .arg("-eject")
-            .arg("-dao")
-            .arg("-pad")
-            .arg("dev=")
-            .arg(CD_WRITER_DEVICE)
-            .arg("-audio")
-            .args(wav_files)
-            .status()
-            .context("Failed to execute wodim. Check device path and permissions.")?;
-
-        if !status.success() {
-            anyhow::bail!("CD burning failed (wodim exit code error).");
-        }
-
-        println!("\n✅ CD Burning Complete. Disc ejected.");
         Ok(())
+    }));
+
+    let stderr_sender = msgs.clone();
+    handles.push(thread::spawn(move || -> Result<()> {
+        for line in stderr.lines() {
+            let line = line.context("failed to obtain line from stderr")?;
+            stderr_sender
+                .send(
+                    LogLine {
+                        is_stderr: false,
+                        line,
+                    }
+                    .into(),
+                )
+                .context("failed to send")?;
+        }
+        Ok(())
+    }));
+
+    let status = wodim.wait().context("failed to wait for wodim to exit")?;
+
+    if !status.success() {
+        msgs.send(Err(anyhow::anyhow!("failed to burn playlist")).into())
+            .context("failed to send")?;
+        return Ok(());
     }
+
+    msgs.send(Ok(String::from("✅ CD Burning Complete. Disc ejected.")).into())
+        .context("failed to send")?;
+
+    for handle in handles {
+        if let Err(_) = handle.join() {
+            anyhow::bail!("pipe failed");
+        }
+    }
+
+    Ok(())
 }
 
 /// Prints the current playlist selection.
@@ -406,14 +531,34 @@ Command:
                     .parse()
                     .context("failed to parse ID as integer")?;
 
-                state.playlist_add(id)?;
+                state.playlist_add_by_id(id)?;
             }
             Some("clear") => {
-                state.playlist_clear()?;
+                state.playlist_clear();
                 println!("playlist has been cleared");
             }
             Some("burn") => {
-                state.playlist_burn()?;
+                let (handle, rx) = state.burn().context("failed to setup burning task")?;
+
+                while let Ok(msg) = rx.recv() {
+                    match msg {
+                        LogMessage::Line(LogLine { is_stderr, line }) => {
+                            if is_stderr {
+                                eprintln!("{}", line)
+                            } else {
+                                println!("{}", line)
+                            }
+                        }
+                        LogMessage::Complete(result) => {
+                            let output = result?;
+                            println!("{}", output);
+                        }
+                    }
+                }
+
+                if let Err(_) = handle.join() {
+                    eprintln!("failed to join on burning playlist thread");
+                }
             }
             Option::None | Some("list") => {
                 playlist_print(&state.playlist[..]);
