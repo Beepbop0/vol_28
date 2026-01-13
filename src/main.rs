@@ -1,5 +1,6 @@
 mod app;
 mod build_db;
+mod view;
 
 use anyhow::Context;
 use std::env;
@@ -11,6 +12,9 @@ fn basic_mode() -> anyhow::Result<()> {
     let mut args = env::args();
 
     match (args.next(), args.next().as_deref()) {
+        (Some(_), Some("tui")) => {
+            crate::view::run_tui().context("error encountered when running TUI")?;
+        }
         (Some(_), Some("shell")) => {
             crate::app::run_shell().context("error encountered when running shell")?;
         }
@@ -24,7 +28,10 @@ fn basic_mode() -> anyhow::Result<()> {
             build_db::build_db(&music_dir)?;
         }
         (Some(prog), _) => {
-            eprintln!("Usage: {} <shell> | <scan> <path_to_music_library>", prog)
+            eprintln!(
+                "Usage: {} <tui> | <shell> | <scan> <path_to_music_library>",
+                prog
+            )
         }
         _ => eprintln!("how did you even call this program?!"),
     }

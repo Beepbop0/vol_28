@@ -172,11 +172,11 @@ impl AppState {
     }
 
     pub fn conn(&self) -> &Connection {
-        return &self.conn;
+        &self.conn
     }
 
-    pub fn playlist(&self) -> Vec<Song> {
-        return self.playlist.clone();
+    pub fn playlist(&self) -> &[Song] {
+        &self.playlist
     }
 
     pub fn playlist_add_by_id(&mut self, id: i64) -> Result<()> {
@@ -214,7 +214,7 @@ impl AppState {
 
     pub fn burn(&self) -> Result<(thread::JoinHandle<Result<()>>, mpsc::Receiver<LogMessage>)> {
         let (tx, rx) = mpsc::channel();
-        let playlist = self.playlist();
+        let playlist = self.playlist().to_vec();
         let handle = thread::spawn(move || -> Result<()> {
             playlist_burn(playlist, tx).context("failed to burn playlist")
         });
