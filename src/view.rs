@@ -544,9 +544,9 @@ fn ui(f: &mut Frame, view: &mut View) {
 
     // --- BOTTOM BAR ---
     view.help = match view.active_pane {
-        ActivePane::Artists => &ARTIST_HELP,
-        ActivePane::ArtistTracks => &TRACK_HELP,
-        ActivePane::Playlist => &PLAYLIST_HELP,
+        ActivePane::Artists => &ARTIST_HELP[..],
+        ActivePane::ArtistTracks => &TRACK_HELP[..],
+        ActivePane::Playlist => &PLAYLIST_HELP[..],
     };
     let tabs = Tabs::new(view.help.iter().cloned())
         .block(Block::default().borders(Borders::ALL).title(" Actions "))
